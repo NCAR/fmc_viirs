@@ -1,0 +1,192 @@
+import logging, sys, yaml, random, os, numpy as np
+from fmcml.data import load_data, load_splitter
+from echo.src.base_objective import BaseObjective
+from sklearn.preprocessing import StandardScaler, QuantileTransformer
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_percentage_error
+from collections import defaultdict
+#from cuml import ElasticNet
+from sklearn.linear_model import ElasticNet
+import pandas as pd
+import tqdm, torch, shutil, os, joblib
+import optuna
+
+is_cuda = torch.cuda.is_available()
+device = 0 if is_cuda else -1
+
+
+def seed_everything(seed=1234):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    #if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+    #torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    
+    
+
+def trainer(conf, trial = False, verbose = True):
+    seed = conf["seed"]
+    seed_everything(seed)
+    
+    save_loc = conf["save_loc"]
+    data_loc = conf["data_loc"]
+    #input_vars = conf["input_vars"]
+    total_input_vars = []
+    if conf["use_nwm"]:
+        total_input_vars += conf["nwm_vars"]
+    if conf["use_sat"]:
+        total_input_vars += conf["sat_vars"]
+    if conf["use_static"]:
+        total_input_vars += conf["static_vars"]
+    if conf["use_hrrr"]:
+        total_input_vars += conf["hrrr_vars"]
+    
+    if len(total_input_vars) == 0:
+        if trial is not False:
+            raise optuna.TrialPruned()
+        else:
+            raise OSError(
+                "ECHO suggested no input columns, sigaling to prune this trial")
+    
+    #static_vars = conf["static_vars"]
+    output_vars = conf["output_vars"]
+    verbose = conf["verbose"]
+    #total_input_vars = input_vars + static_vars
+    splitter = conf["split_type"]
+    
+    # model config
+    n_splits = conf["model"]["n_splits"]
+    n_jobs = conf["model"]["n_jobs"]
+    metric = conf["model"]["metric"]
+    alpha = conf["model"]["alpha"]
+    l1_ratio = conf["model"]["l1_ratio"]
+    
+    # Load the data frame with filtered columns 
+    df = load_data(
+        data_loc,
+        verbose = verbose,
+        filter_input_vars = total_input_vars, 
+        filter_output_vars = output_vars
+        #impute=True
+    )
+    
+    # Split the data
+    data_folds = load_splitter(
+        splitter,
+        df, 
+        n_splits = n_splits, 
+        seed = seed,
+        verbose = verbose,
+        n_jobs=n_jobs
+    )
+    
+    models = []
+    results_dict = defaultdict(list)
+    for k_fold, (train_data, valid_data, test_data) in enumerate(data_folds):
+        scaler_x = QuantileTransformer(n_quantiles=1000, random_state=seed, output_distribution = "normal") #StandardScaler()
+        scaler_y = QuantileTransformer(n_quantiles=1000, random_state=seed, output_distribution = "normal") #StandardScaler()
+        x_train = scaler_x.fit_transform(train_data[total_input_vars])
+        x_valid = scaler_x.transform(valid_data[total_input_vars])
+        x_test  = scaler_x.transform(test_data[total_input_vars])
+        y_train = scaler_y.fit_transform(train_data[output_vars])
+        y_valid = scaler_y.transform(valid_data[output_vars])
+        y_test  = scaler_y.transform(test_data[output_vars])
+        
+#         x_train = train_data[total_input_vars].to_numpy()
+#         x_valid = valid_data[total_input_vars].to_numpy()
+#         x_test  = test_data[total_input_vars].to_numpy()
+#         y_train = train_data[output_vars].to_numpy()
+#         y_valid = valid_data[output_vars].to_numpy()
+#         y_test  = test_data[output_vars].to_numpy()
+
+        elastic_model = ElasticNet(alpha=alpha,l1_ratio=l1_ratio)
+        
+        elastic_model.fit(x_train, 
+                     y_train)
+        
+        y_train = train_data[output_vars].to_numpy()
+        y_valid = valid_data[output_vars].to_numpy()
+        #y_test  = test_data[output_vars].to_numpy()
+        
+        rf_pred_train = scaler_y.inverse_transform(np.expand_dims(elastic_model.predict(x_train), 1)).squeeze(-1)
+        rf_pred_valid = scaler_y.inverse_transform(np.expand_dims(elastic_model.predict(x_valid), 1)).squeeze(-1)
+        
+        results_dict["train_rmse"].append(mean_squared_error(y_train, rf_pred_train)**(1/2))
+        results_dict["valid_rmse"].append(mean_squared_error(y_valid, rf_pred_valid)**(1/2))
+        results_dict["valid_r2"].append(r2_score(y_valid, rf_pred_valid))
+        results_dict["fold"].append(k_fold)
+        models.append(elastic_model)
+    
+    fold_results = pd.DataFrame.from_dict(results_dict).reset_index()
+    best_fold = [i for i,j in enumerate(fold_results[metric]) if j == min(fold_results[metric])][0]
+    
+    if trial == False:
+        return models[best_fold], fold_results
+        
+    results = {
+        "fold": best_fold,
+        "train_rmse": fold_results["train_rmse"][best_fold],
+        "valid_rmse": fold_results["valid_rmse"][best_fold],
+        "valid_r2": fold_results["valid_r2"][best_fold]
+    }
+    
+    return results
+
+
+class Objective(BaseObjective):
+
+    def __init__(self, config, metric="val_loss", device="cpu"):
+
+        # Initialize the base class
+        BaseObjective.__init__(self, config, metric, device)
+
+    def train(self, trial, conf):
+        return trainer(conf, trial = trial, verbose = False)
+#         try:
+#             return trainer(conf, trial = trial, verbose = False)
+#         except Exception as E:
+#             if "CUDA" in str(E):
+#                 logging.warning(
+#                     f"Pruning trial {trial.number} due to CUDA memory overflow: {str(E)}.")
+#                 raise optuna.TrialPruned()
+#             else:
+#                 logging.warning(
+#                     f"Trial {trial.number} failed due to error: {str(E)}.")
+#                 raise E
+        
+
+if __name__ == '__main__':
+    
+    if len(sys.argv) < 2:
+        print("Usage: python train_rforest.py model.yml")
+        sys.exit()
+        
+    # ### Set up logger to print stuff
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
+
+    # Stream output to stdout
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+    root.addHandler(ch)
+    
+    # ### Load the configuration and get the relevant variables
+    config = sys.argv[1]
+    with open(config) as cf:
+        conf = yaml.load(cf, Loader=yaml.FullLoader)
+        
+    save_loc = conf["save_loc"]
+    os.makedirs(save_loc, exist_ok = True)
+    if not os.path.join(save_loc, "model.yml"):
+        shutil.copyfile(config, os.path.join(save_loc, "model.yml"))
+        
+    model, results = trainer(conf)
+    print(results)
+    
+    with open(os.path.join(save_loc, "model_results.pkl"), "wb") as fid:
+        joblib.dump([model, results], fid)
+        
